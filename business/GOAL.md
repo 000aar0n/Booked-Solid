@@ -1,0 +1,26 @@
+# AI front desk business for salons and barbershops
+
+Goal ID: goal_344b0e22d602
+Goal slug: ai-front-desk-business-for-salons-and-barbershops
+
+## Description
+A new business separate from Chromatism, started 2026-11-16. Aaron is the front: he walks in, sells and holds the relationships. Jarvis runs the operation: an AI front desk for salons and barbershops that answers calls, messages and email around the clock, books appointments, handles support and follows up with customers, sold as a monthly service.
+
+## Day 1 state (Mon 2026-11-16 night)
+
+- Model, product and vertical decided by Aaron. Business name pending his pick (options given: Open Chair, my recommendation, Always Booked, After Hours, Booked Solid).
+- Demo stack already exists from the Jarvis phone line build: Vapi voice line with an OpenJarvis and DeepSeek brain, a live data lookup bridge, email and messaging. The demo line still needs dressing as a salon front desk (demo salon persona, services, prices, booking flow).
+- First prospect list, all walkable from home and all dark early: Hair Bar NYC, 843 Lexington Ave (appointment only, closes 7 PM); Beyond The Beard, 170 E 61st St (closes 8 PM, shut Sundays); Debonair, 127 E 60th St (appointments required, closes 8 PM); Willy's Hair Styling, 209 E 81st St (closes 6 PM); Sharp Styles Barbershop, 172 E 85th St (closes 6:30 PM); Honeybliss Salon, 1216 Lexington Ave (closes 8 PM). More candidates from the same search: Level Two Barbershop, 1388 2nd Ave; Fabio's Hair & Color Studio, 1737 2nd Ave (cuts $75 to $120); Il Figaro II, 48 East End Ave.
+
+## Market and offer (researched Mon 2026-11-16 night, vendor pricing pages)
+
+- Salon specific competitors: Rolume from $297/mo plus $500 setup; The Salon Agent from $699/mo plus usage; After Hours AI self-serve tiers $19 to $1,997/mo; MintWire $78/mo self-serve. General AI answering runs about $29 to $199/mo at small business volumes; human answering services run $300+/mo.
+- Competitor pitch math worth reusing: 5 missed calls a week, half would have booked, $90 average service, is about $970/mo in lost bookings (The Salon Agent's own framing). Upper East Side prices run higher than $90 for color work.
+- Offer LOCKED by Aaron Mon 23:03 and refined by him Mon 23:04, superseding my recommendation: **$249.99 setup fee plus $199.99/mo per location.** (My earlier draft was $249/mo with no setup and a free pilot; Aaron replaced it, do not use it.) The setup undercuts Rolume's $500 while the monthly stays clear of the cheap self-serve software tier.
+- Demo line built Mon night: Vapi assistant "Booked Solid Demo" (id bd9a8a3a-ece8-4028-94fd-b5262fdf32d5, OpenAI gpt-4.1, Vapi voice Elliot) attached to the free Vapi number +1 (929) 307-2035, so anyone can call it inbound. It answers as the front desk of a fictional shop, Marlowe Barber Company (services $30 to $65, barbers Marcus, Dee and Tony, hours Mon to Sat 9 to 8, Sun 10 to 5), quotes prices, books appointments conversationally and takes messages. The Jarvis personal assistant moved off that number; Jarvis is on the Telnyx number +1 (929) 307-0119 inbound and outbound as before.
+- Targeting refined by Aaron Mon 23:55: prioritize richer, premium shops most likely to pay $199.99/mo (premium prices, booking-led, multi-chair, high review volume). A premium tier list is being built in hidden_files/premium-list.md and waves call premium shops in their neighborhoods first.
+- Targeting widened by Aaron Mon 23:51: salons and barbershops all across New York City, not just the Upper East Side. Tomorrow's six UES calls stay as the pilot wave (walkable follow-ups for Aaron); a citywide list is being built in hidden_files/citywide-list.md for waves across neighborhoods from Wed 2026-11-18.
+- Positioning note (Aaron, Mon 23:37): not salons-only. Salons and barbershops are the first vertical and the lead example, but the website copy was broadened to say the front desk works for other appointment-based local businesses too; the wider vertical list is to be figured out later.
+- Website built Mon night (needed for Stripe activation): one public page with the service, the $249.99 / $199.99 pricing and the real business number (929) 307-0119 as the contact; the demo number is deliberately not on it. Public URL: https://muse.ai/s/booked-solid-xgxi6xkixnxbxpxoxna/VMJS3-YAeG8wWuIsY5fm1yDdSpy5PDUAy0JYvJ_xQrI
+- Outreach plan set by Aaron Mon 23:06 and moved up by him Mon 23:12: he upgraded Telnyx to Paid that same night (a night early), verified by a live test call to a non-verified number, which connected. Aaron picked live calls over voicemail drops. The caller is the Vapi assistant "Booked Solid Outreach" (id c36426ed-b325-46c8-9287-2da3471fddd9), scripted to pitch briefly, point owners to the demo line, and win a 10-minute meeting with Aaron; the full call list, numbers, angles and outcomes log live in hidden_files/call-kit.md. The six calls run Tue 2026-11-17 late morning (job booked-solid-telnyx-upgrade-reminder, fires about 11:39 EST), one per shop, outcomes logged in the call kit and summarized to Aaron.
+- Our costs per client are small (Vapi plus Telnyx minutes, DeepSeek usage), so the margin at $249 is wide even at a few hundred calls a month.
