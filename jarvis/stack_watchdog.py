@@ -21,7 +21,9 @@ Never prints secrets. Safe to run any time; a no-op when healthy.
 import json
 import os
 import re
+import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -49,22 +51,32 @@ def fetch(url, timeout=10, data=None):
 
 
 def local_ok(port, path="/"):
-    status, _ = fetch("http://127.0.0.1:%d%s" % (port, path), timeout=5)
-    return status is not None
+    status, body = fetch("http://127.0.0.1:%d/health" % port, timeout=5)
+    try:
+        health = json.loads(body)
+        return status == 200 and health.get("service") == "booked-solid-lookup" and health.get("version") == 2
+    except (ValueError,TypeError):
+        return False
 
 
 def launch_detached(argv, logname, cwd=None):
-    log = open(os.path.join(BASE, logname), "ab")
-    subprocess.Popen(argv, stdout=log, stderr=log, cwd=cwd,
-                     start_new_session=True, stdin=subprocess.DEVNULL)
+    with open(os.path.join(BASE, logname), "ab") as log:
+        process = subprocess.Popen(argv, stdout=log, stderr=log, cwd=cwd,
+                                   start_new_session=True, stdin=subprocess.DEVNULL)
+    return process
 
 
 def ensure_bridge():
     if not local_ok(8791, "/"):
+        status, _ = fetch("http://127.0.0.1:8791/health",timeout=2)
+        if status is not None:
+            raise RuntimeError("legacy_or_unexpected_bridge_listener")
         launch_detached(["python3", os.path.join(BASE, "server.py")],
                         "server.log", cwd=BASE)
         time.sleep(3)
         repairs.append("lookup bridge restarted")
+        if not local_ok(8791):
+            raise RuntimeError("bridge_start_failed")
 
 
 def tunnel_alive(base_url):
@@ -72,10 +84,26 @@ def tunnel_alive(base_url):
         return False
     status, body = fetch(base_url + "/lookup", timeout=45,
                          data=b'{"query": "weather in New York"}')
-    return status == 200 and "no tunnel" not in body
+    try:
+        result = json.loads(body)
+        return status == 200 and isinstance(result,dict) and bool(result.get("result") or result.get("results"))
+    except (ValueError,TypeError):
+        return False
 
 
 def start_tunnel(port, logname):
+    pidpath = os.path.join(BASE,"tunnel-%d.pid" % port)
+    try:
+        with open(pidpath) as stream:
+            oldpid = int(stream.read())
+        with open("/proc/%d/cmdline" % oldpid,"rb") as stream:
+            args = stream.read().decode().split("\0")
+        if (os.path.basename(args[0])=="ssh" and "nokey@localhost.run" in args
+                and "80:localhost:%d" % port in args
+                and os.stat("/proc/%d" % oldpid).st_uid==os.getuid()):
+            os.kill(oldpid,signal.SIGTERM)
+    except (OSError,ValueError,IndexError):
+        pass
     argv = ["ssh", "-o",
             "ProxyCommand=python3 %s %%h %%p"
             % os.path.join(BASE, "proxyconnect.py"),
@@ -89,7 +117,10 @@ def start_tunnel(port, logname):
         open(logpath, "w").close()
     except OSError:
         pass
-    launch_detached(argv, logname)
+    process = launch_detached(argv, logname)
+    with open(pidpath,"w") as stream:
+        stream.write(str(process.pid))
+    os.chmod(pidpath,0o600)
     for _ in range(12):
         time.sleep(2)
         try:
@@ -104,9 +135,7 @@ def start_tunnel(port, logname):
 
 
 def rebuild_tunnel():
-    pat = "nokey@" + "localhost" + ".run"
-    subprocess.run(["pkill", "-f", pat], capture_output=True)
-    time.sleep(2)
+    # Do not kill every localhost.run tunnel: other apps may own them.
     bridge = start_tunnel(8791, "tunnel-8791.log")
     if not bridge:
         return None
@@ -118,11 +147,13 @@ def rebuild_tunnel():
         urls = {}
     urls["bridge"] = bridge
     urls.pop("brain", None)
-    with open(URLS_FILE, "w") as f:
-        json.dump(urls, f)
-    subprocess.run(["python3", VAPI, "update-tool-url", TOOL_ID,
+    updated = subprocess.run(["python3", VAPI, "update-tool-url", TOOL_ID,
                     bridge + "/lookup"], capture_output=True,
                    timeout=60)
+    if updated.returncode != 0:
+        raise RuntimeError("tool_url_update_failed")
+    with open(URLS_FILE, "w") as f:
+        json.dump(urls, f)
     repairs.append("bridge tunnel rebuilt and tool rewired")
     return bridge
 
@@ -139,15 +170,21 @@ def main():
         bridge = rebuild_tunnel()
         if bridge is None:
             print("FAILED bridge tunnel could not be rebuilt")
-            return
+            return 1
         if not tunnel_alive(bridge):
             print("FAILED bridge tunnel rebuilt but not answering")
-            return
+            return 1
     if repairs:
         print("REPAIRED " + "; ".join(repairs))
     else:
         print("HEALTHY")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print("FAILED "+type(exc).__name__)
+        sys.exit(1)
+

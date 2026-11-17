@@ -10,7 +10,13 @@ Vapi function-call envelope in, {"result": "..."} out. Plain
 {"query": "..."} is also accepted for local testing.
 """
 import json
+import hmac
+import os
 import re
+import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -22,6 +28,9 @@ TIMEOUT = 3
 # while slow fallbacks chain; past the deadline the bridge answers
 # "empty" and the assistant replies from general knowledge.
 DEADLINE = 6.0
+POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lookup")
+SLOTS = threading.BoundedSemaphore(4)
+MAX_BODY = 16384
 
 
 def fetch(url):
@@ -151,7 +160,7 @@ def fact_lookup(query):
     return None
 
 
-def lookup(query):
+def lookup_sources(query):
     import time
     t0 = time.time()
 
@@ -184,47 +193,91 @@ def lookup(query):
             "knowledge and say the live lookup came back empty.")
 
 
+def lookup(query, timeout=None):
+    if not SLOTS.acquire(blocking=False):
+        return "Live lookup is busy. Say you could not verify the current fact; do not guess."
+    def work():
+        try:
+            return lookup_sources(query)
+        finally:
+            SLOTS.release()
+    future = POOL.submit(work)
+    try:
+        return future.result(timeout=DEADLINE if timeout is None else max(.001,min(DEADLINE,timeout)))
+    except FutureTimeout:
+        return "Live lookup timed out. Say you could not verify the current fact; do not guess."
+    except Exception:
+        return "Live lookup failed. Say you could not verify the current fact; do not guess."
+
+
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(5)
+
+    def reply(self, status, data):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *args):
         pass
 
     def do_GET(self):
         if self.path == "/health":
-            body = b'{"ok": true}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.reply(200,{"ok":True,"service":"booked-solid-lookup","version":2})
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
+        if self.path != "/lookup":
+            self.reply(404,{"error":"not_found"}); return
+        token = os.environ.get("JARVIS_LOOKUP_TOKEN")
+        if token and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer "+token):
+            self.reply(401,{"error":"unauthorized"}); return
         try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= MAX_BODY:
+                self.reply(413,{"error":"body_limit"}); return
+            raw = self.rfile.read(length)
             data = json.loads(raw)
-        except ValueError:
-            data = {}
+            if not isinstance(data,dict):
+                raise ValueError
+        except (ValueError, socket.timeout):
+            self.reply(400,{"error":"invalid_body"}); return
         msg = data.get("message") or {}
+        if not isinstance(msg,dict):
+            self.reply(400,{"error":"invalid_message"}); return
         # Current Vapi tool protocol: a "tool-calls" envelope with a
         # toolCallList; the answer must come back as a results array
         # keyed by toolCallId, or Vapi reports "No result returned".
         if msg.get("type") == "tool-calls" or msg.get("toolCallList"):
+            calls = msg.get("toolCallList") or []
+            if not isinstance(calls,list) or len(calls)>3 or any(not isinstance(c,dict) for c in calls):
+                self.reply(400,{"error":"invalid_tool_calls"}); return
             results = []
-            for call in msg.get("toolCallList") or []:
-                args = (call.get("function") or {}).get("arguments")
+            deadline = time.monotonic() + DEADLINE
+            for call in calls:
+                function = call.get("function") or {}
+                args = function.get("arguments") if isinstance(function,dict) else {}
                 if isinstance(args, str):
                     try:
                         args = json.loads(args)
                     except ValueError:
                         args = {}
-                q = (args or {}).get("query") or ""
+                if not isinstance(args,dict):
+                    args = {}
+                q = args.get("query") or ""
                 try:
-                    r = lookup(str(q))
-                except Exception as exc:  # never hang a live call
-                    r = "The live lookup failed: %s" % exc
+                    remaining = deadline - time.monotonic()
+                    r = lookup(str(q)[:1000], remaining) if remaining > 0 else "Lookup deadline reached; current fact could not be verified."
+                except Exception:
+                    r = "The live lookup failed; the current fact could not be verified."
                 results.append({"toolCallId": call.get("id"),
                                 "result": r})
             body = json.dumps({"results": results}).encode()
@@ -236,14 +289,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = None
         if msg.get("type") == "function-call":
-            params = (msg.get("functionCall") or {}).get("parameters") or {}
+            function = msg.get("functionCall") or {}
+            params = function.get("parameters") if isinstance(function,dict) else {}
+            if not isinstance(params,dict):
+                params = {}
             query = params.get("query")
         if not query:
             query = data.get("query") or ""
         try:
-            result = lookup(str(query))
-        except Exception as exc:  # never hang a live call
-            result = "The live lookup failed: %s" % exc
+            result = lookup(str(query)[:1000])
+        except Exception:
+            result = "The live lookup failed; the current fact could not be verified."
         body = json.dumps({"result": result}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -254,3 +310,4 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ThreadingHTTPServer(("127.0.0.1", 8791), Handler).serve_forever()
+

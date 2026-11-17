@@ -1,5 +1,13 @@
 # Booked Solid
 
+## 2026-11-17 source repair
+
+The repository now includes autonomous routine-call delivery controls, a fixed alert caller ID, honest simulated-booking prompts, direct Stripe checkout handoffs through Muse Mail, and offline tests. No per-call owner approval gate or SMS integration was added. Owner notifications go through Muse.
+
+**Source changes are not proof of a live rollout.** Read [REPAIR_STATUS.md](REPAIR_STATUS.md) and run the installer in the authorized Muse VM. The installer preserves existing model/voice settings, checks the four saved assistants and performs no real calls, sends or payments. The new checkout watcher and revised wave tasks must be installed in Muse's scheduler. The Stripe checkout amounts still require a live account check.
+
+The runtime inventory below was reported in the original Muse export and is not an independent live verification from Work.
+
 An AI front desk business for salons and barbershops, founded by Aaron Kotchen (New York). Aaron is the human front: sales and relationships. Jarvis, his AI agent, runs the operation: it answers calls, messages and email around the clock, books appointments, handles support and follows up with customers, sold as a monthly service.
 
 Pricing: $249.99 setup fee plus $199.99 per month per location. No contract.
@@ -35,3 +43,4 @@ Live pieces:
 ## Editing notes
 
 The assistants' prompts live inside `connectors/custom.vapi/bin/vapi.py` as command builders (set-cloud-brain, update-demo, update-outreach, set-speaking-plans, set-voice). The live assistants are configured by running those commands, not by editing this repo; this repo is the source and the record.
+

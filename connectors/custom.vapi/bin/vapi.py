@@ -7,14 +7,18 @@ for the registered connection custom.vapi, and Muse swaps in the real key
 only on requests to api.vapi.ai.
 """
 import json
+import os
 import sys
+import time
+import urllib.error
 import urllib.request
 
-sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
-from dynamic_credentials import add_surrogate_to_request, read_json_response
+from call_runtime import Delivery, diagnosis
+from checkout import PURCHASE_RULES, extraction_plan, handoff
 
 BASE = "https://api.vapi.ai"
 HOSTS = ["api.vapi.ai"]
+TELNYX_NUMBER_ID = "45d8d383-906e-4b88-ad9c-5da9ef6ce10a"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36")
 
@@ -24,7 +28,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError("redirect refused, verify the endpoint")
 
 
-def call_api(method, path, body=None):
+def transport(method, path, body=None):
+    # Keep the Muse vault boundary. No environment-key or model-visible fallback.
+    sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
+    try:
+        from dynamic_credentials import add_surrogate_to_request, read_json_response
+    except ImportError:
+        return 503, {"error":"muse_vault_unavailable", "detail":"Run inside the authorized Muse runtime; credentials were not read."}
     data = None
     headers = {"User-Agent": UA}
     if body is not None:
@@ -38,12 +48,113 @@ def call_api(method, path, body=None):
         with opener.open(request, timeout=30) as response:
             return response.status, read_json_response(response)
     except urllib.error.HTTPError as err:
-        raw = err.read().decode("utf-8", "replace")
-        try:
-            payload = json.loads(raw)
-        except ValueError:
-            payload = {"raw": raw[:500]}
-        return err.code, payload
+        # Provider errors can echo secrets/configuration; use codes, not raw bodies.
+        return err.code, {"error":"provider_rejected", "http_status":err.code}
+    except Exception:
+        return 503, {"error":"provider_request_uncertain"}
+
+
+def read_api(method, path, body=None):
+    attempts = 3 if method == "GET" else 1
+    for attempt in range(attempts):
+        status, payload = transport(method, path, body)
+        if status not in (429, 502, 503, 504) or attempt == attempts-1:
+            return status, payload
+        time.sleep(.25 * (2 ** attempt))
+
+
+CALL_RULES = (
+    " CAPABILITY AND DELIVERY RULES: You are an AI assistant. Routine outreach calls "
+    "on the existing prospect lists have standing owner permission; do not ask for "
+    "per-call approval. That permission is not a booking/calendar receipt. You have "
+    "no booking or SMS tool unless one is actually attached and returns success. "
+    "Without that receipt, collect a requested time and say it is a request pending "
+    "confirmation. Never promise an appointment, callback time, calendar availability, "
+    "payment, confirmation text or next-day launch without verified backing. "
+    "On the fictional Marlowe demo, clearly call it a simulated booking and explain "
+    "that no real appointment or text will be created. If you reach another AI, "
+    "voicemail loop, or repeated goodbye, stop the conversation and end the call. "
+    "Respect a refusal or do-not-call request immediately. Do not repeat a pitch. "
+    "Do not invent tool results, current facts, connected integrations or completed work."
+)
+
+
+def assistant_policy(body, outreach=False):
+    body = json.loads(json.dumps(body))
+    model = body.get("model") or {}
+    for message in model.get("messages") or []:
+        if message.get("role") == "system" and isinstance(message.get("content"), str):
+            if CALL_RULES not in message["content"]:
+                message["content"] += CALL_RULES
+            if outreach and PURCHASE_RULES not in message["content"]:
+                message["content"] += PURCHASE_RULES
+    # Bound all configured assistants, including inbound demo loops.
+    body["maxDurationSeconds"] = min(body.get("maxDurationSeconds",600),600)
+    body["endCallPhrases"] = list(dict.fromkeys((body.get("endCallPhrases") or [])+["Goodbye."]))
+    if outreach:
+        body["analysisPlan"] = {**(body.get("analysisPlan") or {}),"structuredDataPlan":extraction_plan()}
+    return body
+
+
+def repair_assistants(apply=False):
+    ids = ["189f4d6b-44b8-407b-9ff6-93b88a6a5f43", "bd9a8a3a-ece8-4028-94fd-b5262fdf32d5",
+           "c36426ed-b325-46c8-9287-2da3471fddd9", "16150103-65bc-4018-8649-eaf2ed6ab66b"]
+    prepared = []
+    for assistant_id in ids:
+        status, current = read_api("GET", "/assistant/"+assistant_id)
+        if status != 200 or not isinstance(current.get("model"),dict):
+            return 503, {"error":"assistant_preflight_failed","assistant_id":assistant_id,"no_changes_started":True}
+        body = assistant_policy({"model":current["model"],"maxDurationSeconds":current.get("maxDurationSeconds",600),"endCallPhrases":current.get("endCallPhrases") or []})
+        if assistant_id == "bd9a8a3a-ece8-4028-94fd-b5262fdf32d5":
+            body["firstMessage"] = "Marlowe Barber Company demo, AI front desk. How can I help you?"
+        elif assistant_id == "c36426ed-b325-46c8-9287-2da3471fddd9":
+            body["firstMessage"] = "Hi, this is Jarvis, an AI assistant calling for Booked Solid. Is the owner or manager available for a quick minute?"
+        for message in body["model"].get("messages",[]):
+            if message.get("role") != "system":
+                continue
+            text = message.get("content", "")
+            text = text.replace("say it is booked and that a confirmation text will follow", "say this is a simulated demo request; no real appointment or text is created")
+            text = text.replace("tell them Aaron will be there or on the phone at that time", "tell them Aaron will confirm the requested meeting time")
+            text = text.replace("their front desk can be live by tomorrow night", "Aaron will confirm their setup timeline")
+            text = text.replace("$249.99 setup charged today and $199.99 a month after that", "$249.99 setup plus the first $199.99 month, $449.98 initially before taxes/fees, then $199.99 monthly")
+            text = text.replace("promise the shop will call back as soon as it opens", "record a callback request without promising a time")
+            if assistant_id == "c36426ed-b325-46c8-9287-2da3471fddd9" and PURCHASE_RULES not in text:
+                text += PURCHASE_RULES
+            message["content"] = text
+        if assistant_id == "c36426ed-b325-46c8-9287-2da3471fddd9":
+            body["analysisPlan"] = {**(current.get("analysisPlan") or {}),"structuredDataPlan":extraction_plan()}
+        prepared.append((assistant_id,body))
+    if not apply:
+        return 200, {"preview":True,"assistant_ids":ids,"changes":["honest booking/callback claims","600-second maximum","standing routine-call permission","direct checkout handoff"],"calls_placed":0}
+    results = []
+    for assistant_id,body in prepared:
+        status, _ = read_api("PATCH","/assistant/"+assistant_id,body)
+        verified = False
+        if 200 <= status < 300:
+            code, saved = read_api("GET","/assistant/"+assistant_id)
+            verified = code == 200 and saved.get("model") == body["model"] and saved.get("maxDurationSeconds") == body["maxDurationSeconds"]
+            if "analysisPlan" in body:
+                verified = verified and (saved.get("analysisPlan") or {}).get("structuredDataPlan") == body["analysisPlan"]["structuredDataPlan"]
+        results.append({"assistant_id":assistant_id,"http_status":status,"verified":verified})
+        if not verified:
+            return 503, {"results":results,"detail":"Partial/unknown update; inspect current provider state before repeating.","calls_placed":0}
+    return 200, {"results":results,"calls_placed":0}
+
+
+def redact(value):
+    if isinstance(value,dict):
+        return {k:("[REDACTED]" if any(x in k.lower() for x in ("password","secret","token","apikey","api_key","authorization","headers")) else redact(v)) for k,v in value.items()}
+    if isinstance(value,list):
+        return [redact(v) for v in value]
+    return value
+
+
+def call_api(method, path, body=None):
+    if method == "POST" and path in ("/call", "/call/phone"):
+        return Delivery(read_api).dial(body)
+    if body and ((method == "POST" and path == "/assistant") or (method == "PATCH" and path.startswith("/assistant/"))):
+        body = assistant_policy(body,outreach=(path.endswith("/c36426ed-b325-46c8-9287-2da3471fddd9") or body.get("name")=="Booked Solid Outreach"))
+    return read_api(method, path, body)
 
 
 def main(argv):
@@ -99,6 +210,54 @@ def main(argv):
         status, payload = call_api("POST", "/call/phone", body)
     elif cmd == "get-call":
         status, payload = call_api("GET", "/call/" + argv[2])
+        if status == 200:
+            payload = {**payload, "delivery_diagnosis":diagnosis(payload)}
+    elif cmd == "reconcile":
+        status, payload = 200, Delivery(read_api).reconcile()
+    elif cmd == "do-not-call":
+        Delivery(read_api).block(argv[2])
+        status, payload = 200, {"suppressed":True}
+    elif cmd == "diagnose":
+        results = {}
+        for label, path in (("assistants","/assistant"),("numbers","/phone-number"),("calls","/call?limit=20")):
+            code, data = read_api("GET",path)
+            items = data if isinstance(data,list) else []
+            results[label] = {"http_status":code,"items":[{
+                key:item.get(key) for key in ("id","name","provider","assistantId","status","endedReason") if key in item
+            } for item in items]}
+        status, payload = (200 if all(v["http_status"]==200 for v in results.values()) else 503), results
+    elif cmd == "repair-assistants":
+        status, payload = repair_assistants(apply="--apply" in argv[2:])
+    elif cmd == "checkout-link":
+        from checkout import CHECKOUT_URL
+        status, payload = 200, {"url":CHECKOUT_URL,"notice":"Fixed link only; no message sent or payment verified."}
+    elif cmd == "checkout-pending":
+        status, calls = read_api("GET","/call?limit=100")
+        payload = []
+        if status == 200 and isinstance(calls,list):
+            delivery = Delivery(read_api)
+            with delivery.db() as db:
+                db.execute("CREATE TABLE IF NOT EXISTS checkout_delivery(call_id TEXT PRIMARY KEY,state TEXT,receipt TEXT)")
+                known = {r["call_id"] for r in db.execute("SELECT call_id FROM checkout_delivery")}
+            for call in calls:
+                candidate = handoff(call)
+                if candidate and candidate["call_id"] not in known:
+                    payload.append(candidate)
+    elif cmd == "checkout-claim":
+        delivery = Delivery(read_api)
+        with delivery.db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS checkout_delivery(call_id TEXT PRIMARY KEY,state TEXT,receipt TEXT)")
+            import sqlite3
+            try:
+                db.execute("INSERT INTO checkout_delivery VALUES(?,?,?)",(argv[2],"sending",None))
+                status, payload = 200, {"claimed":True,"call_id":argv[2]}
+            except sqlite3.IntegrityError:
+                status, payload = 409, {"claimed":False,"detail":"Already claimed/sent; reconcile Muse Mail instead of resending."}
+    elif cmd == "checkout-complete":
+        delivery = Delivery(read_api)
+        with delivery.db() as db:
+            changed = db.execute("UPDATE checkout_delivery SET state='sent',receipt=? WHERE call_id=? AND state='sending'",(argv[3],argv[2])).rowcount
+            status, payload = (200 if changed else 409), {"recorded":bool(changed)}
     elif cmd == "update-assistant":
         # vapi.py update-assistant <assistantId>
         body = {
@@ -274,7 +433,7 @@ def main(argv):
         # vapi.py create-demo  (Booked Solid salon front desk demo)
         body = {
             "name": "Booked Solid Demo",
-            "firstMessage": ("Marlowe Barber Company, front desk. "
+            "firstMessage": ("Marlowe Barber Company demo, AI front desk. "
                              "How can I help you?"),
             "firstMessageMode": "assistant-speaks-first",
             "model": {
@@ -308,10 +467,11 @@ def main(argv):
                         "theirs is taken, keeping to shop hours. "
                         "Always read the booking back in full: "
                         "service, barber, day, time, name, and say "
-                        "it is booked and that a confirmation text "
-                        "will follow. Never claim to see a live "
-                        "calendar; if pressed, say the desk confirms "
-                        "every booking when the shop opens. "
+                        "this is a simulated booking for the demo, "
+                        "not a real appointment. No confirmation text "
+                        "will be sent. For a real shop, record only a "
+                        "request until its live calendar returns a "
+                        "successful booking receipt. "
                         "QUESTIONS: answer prices, hours, services, "
                         "walk-ins (walk-ins are welcome, booked "
                         "clients go first) and where the shop is "
@@ -326,8 +486,8 @@ def main(argv):
                         "HUMAN REQUESTS AND PROBLEMS: if a caller "
                         "insists on a human, has a complaint, or "
                         "anything urgent comes up, take their name "
-                        "and number, promise the shop will call back "
-                        "as soon as it opens, and thank them. Never "
+                        "and number as a callback request, then "
+                        "thank them. Do not promise a callback time. Never "
                         "argue. "
                         "This is a demonstration line for Booked "
                         "Solid. If a caller says they are testing "
@@ -346,7 +506,7 @@ def main(argv):
     elif cmd == "update-demo":
         # vapi.py update-demo  (demo script + live date injection)
         body = {
-            "firstMessage": ("Marlowe Barber Company, front desk. "
+            "firstMessage": ("Marlowe Barber Company demo, AI front desk. "
                              "How can I help you?"),
             "firstMessageMode": "assistant-speaks-first",
             "model": {
@@ -393,10 +553,11 @@ def main(argv):
                         "theirs is taken, keeping to shop hours. "
                         "Always read the booking back in full: "
                         "service, barber, day, time, name, and say "
-                        "it is booked and that a confirmation text "
-                        "will follow. Never claim to see a live "
-                        "calendar; if pressed, say the desk confirms "
-                        "every booking when the shop opens. "
+                        "this is a simulated booking for the demo, "
+                        "not a real appointment. No confirmation text "
+                        "will be sent. For a real shop, record only a "
+                        "request until its live calendar returns a "
+                        "successful booking receipt. "
                         "QUESTIONS: answer prices, hours, services, "
                         "walk-ins (walk-ins are welcome, booked "
                         "clients go first) and where the shop is "
@@ -411,8 +572,8 @@ def main(argv):
                         "HUMAN REQUESTS AND PROBLEMS: if a caller "
                         "insists on a human, has a complaint, or "
                         "anything urgent comes up, take their name "
-                        "and number, promise the shop will call back "
-                        "as soon as it opens, and thank them. Never "
+                        "and number as a callback request, then "
+                        "thank them. Do not promise a callback time. Never "
                         "argue. "
                         "This is a demonstration line for Booked "
                         "Solid. If a caller says they are testing "
@@ -434,7 +595,7 @@ def main(argv):
         # vapi.py create-outreach  (Booked Solid sales caller)
         body = {
             "name": "Booked Solid Outreach",
-            "firstMessage": ("Hi, this is Jarvis calling from Booked "
+            "firstMessage": ("Hi, this is Jarvis, an AI assistant calling from Booked "
                              "Solid, here in New York. Is the owner or "
                              "manager around for a quick minute?"),
             "firstMessageMode": "assistant-speaks-first",
@@ -468,8 +629,7 @@ def main(argv):
                         "takes messages, so no booking call ever "
                         "hits voicemail again. It costs $249.99 to "
                         "set up and $199.99 a month, no contract, "
-                        "set up done for them, live by the next "
-                        "night. "
+                        "with setup timing confirmed by Aaron. "
                         "YOUR ONE GOAL on this call: a 10-minute "
                         "meeting or demo call with Aaron, or "
                         "permission to send the shop a one-page "
@@ -534,7 +694,7 @@ def main(argv):
         # vapi.py update-outreach  (revised Booked Solid caller script)
         body = {
             "firstMessage": (
-                "Hi, this is Jarvis calling from Booked Solid here "
+                "Hi, this is Jarvis, an AI assistant calling from Booked Solid here "
                 "in New York. We help shops stop missing booking "
                 "calls after they close. Is the owner or manager "
                 "around for a quick minute? And if it is not for "
@@ -570,8 +730,7 @@ def main(argv):
                         "takes messages, so no booking call ever "
                         "hits voicemail again. It costs $249.99 to "
                         "set up and $199.99 a month, no contract, "
-                        "set up done for them, live by the next "
-                        "night. "
+                        "with setup timing confirmed by Aaron. "
                         "THE OPEN: say who you are and that you are "
                         "calling from Booked Solid here in New "
                         "York, give the one-line reason (you help "
@@ -603,8 +762,9 @@ def main(argv):
                         "name, the best day and time, whether they "
                         "prefer a call or Aaron stopping by, and "
                         "the best callback number. Read it all "
-                        "back to confirm, and tell them Aaron will "
-                        "be there or on the phone at that time. "
+                        "back as a requested meeting time. Say Aaron "
+                        "will confirm availability; do not promise "
+                        "that he will be there at that time. "
                         "PATH B, if they are interested but "
                         "skeptical and would rather deal with a "
                         "person: Aaron himself will call them. "
@@ -615,17 +775,18 @@ def main(argv):
                         "they want to hear the product first, send "
                         "them to the demo line, (929) 307-2035. "
                         "IF THEY SAY YES TO STARTING, close it "
-                        "properly: confirm the deal out loud, "
-                        "$249.99 setup charged today and $199.99 a "
-                        "month after that, no contract, cancel any "
+                        "by restating the offered terms, "
+                        "$249.99 setup plus the first $199.99 month, "
+                        "an initial $449.98 before any taxes or fees, "
+                        "then $199.99 monthly, cancel any "
                         "time. Then collect the best email address "
                         "for the owner (spell it back to confirm) "
                         "and their mobile number. Tell them a "
                         "secure Booked Solid checkout link is "
                         "coming to that email right after this "
                         "call, and once it is paid, setup starts "
-                        "and their front desk can be live by "
-                        "tomorrow night. Never ask for card "
+                        "and Aaron will confirm the setup timeline. "
+                        "Never promise next-day deployment. Never ask for card "
                         "numbers or any payment details on the "
                         "call itself, ever. "
                         "IF THEY ARE ONLY LUKEWARM, ask permission "
@@ -918,8 +1079,22 @@ def main(argv):
         status, payload = call_api("POST", "/call/phone", body)
     elif cmd == "update-tool-url":
         # vapi.py update-tool-url <toolId> <serverUrl>
-        status, payload = call_api("PATCH", "/tool/" + argv[2],
-                                   {"server": {"url": argv[3]}})
+        from urllib.parse import urlsplit
+        url = urlsplit(argv[3])
+        if url.scheme != "https" or not url.hostname or url.username or url.password:
+            raise ValueError("A public HTTPS tool URL is required")
+        status, current = read_api("GET","/tool/"+argv[2])
+        payload = {"error":"tool_preflight_failed"}
+        if status == 200:
+            settings = {**(current.get("server") or {}),"url":argv[3]}
+            token = os.environ.get("JARVIS_LOOKUP_TOKEN")
+            if token:
+                settings["headers"] = {**(settings.get("headers") or {}),"Authorization":"Bearer "+token}
+            status, payload = read_api("PATCH", "/tool/"+argv[2], {"server":settings})
+            if 200 <= status < 300:
+                code, saved = read_api("GET","/tool/"+argv[2])
+                verified = code == 200 and (saved.get("server") or {}).get("url") == argv[3]
+                status, payload = (200 if verified else 503), {"verified":verified,"tool_id":argv[2]}
     elif cmd == "set-openjarvis":
         # vapi.py set-openjarvis <assistantId> <chatCompletionsUrl> <toolId>
         body = {
@@ -974,9 +1149,17 @@ def main(argv):
         print("unknown command: " + cmd)
         return 2
 
-    print(json.dumps({"status": status, "payload": payload}, indent=2))
+    print(json.dumps(redact({"status": status, "payload": payload}), indent=2))
     return 0 if status < 300 else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        sys.exit(main(sys.argv))
+    except (IndexError, ValueError, TypeError):
+        print(json.dumps({"status":400,"error":"invalid_command_arguments"}))
+        sys.exit(2)
+    except Exception as exc:
+        print(json.dumps({"status":503,"error":type(exc).__name__,"detail":"Operation incomplete. Inspect provider state before retrying a write."}))
+        sys.exit(1)
+
