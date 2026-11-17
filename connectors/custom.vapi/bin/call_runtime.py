@@ -125,7 +125,7 @@ class Delivery:
             else:
                 status, data = self.api("GET", "/call?limit=100")
                 calls = data if isinstance(data, list) else data.get("results", [])
-                data = next((c for c in calls if c.get("name") == "BookedSolid-"+row["id"]), None)
+                data = next((c for c in calls if c.get("name") == "BS-"+row["id"]), None)
             if 200 <= status < 300 and isinstance(data, dict) and data.get("id"):
                 self.update(row, data)
                 summaries.append({"attempt_id":row["id"], "call_id":data["id"], "state":data.get("status"),
@@ -175,7 +175,7 @@ class Delivery:
             if active:
                 return 409, {"error":"another_call_pending","attempt_id":active["id"],"call_id":active["call_id"],"detail":"Wait for and reconcile the current call before the next destination."}
             db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?)", (attempt,target,self.now(),"submitting",None,None))
-        body["name"] = "BookedSolid-"+attempt
+        body["name"] = "BS-"+attempt
         overrides = body.setdefault("assistantOverrides", {})
         overrides["maxDurationSeconds"] = duration
         try:
